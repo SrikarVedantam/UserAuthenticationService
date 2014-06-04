@@ -1,5 +1,7 @@
 package co.uk.escape.service;
 
+import static co.uk.escape.RMQQueue.Type.REGISTRATION_RESPONSE;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -7,6 +9,7 @@ import org.springframework.amqp.AmqpException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessageListener;
 import org.springframework.amqp.core.MessagePostProcessor;
+import org.springframework.amqp.core.Queue;
 import org.springframework.amqp.rabbit.core.ChannelAwareMessageListener;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
@@ -15,18 +18,29 @@ import org.springframework.stereotype.Controller;
 
 import com.rabbitmq.client.Channel;
 
+import co.uk.escape.RMQQueue;
 import co.uk.escape.RMQTemplate;
 import co.uk.escape.domain.LoginResponse;
 import co.uk.escape.domain.LoginResponseMessageBundle;
+import co.uk.escape.domain.MessageBundle;
+import co.uk.escape.domain.RegistrationRequest;
+import co.uk.escape.domain.RegistrationRequestMessageBundle;
+
+import static co.uk.escape.RMQExchange.Type.*;
+import static co.uk.escape.RMQQueue.Type.*;
+import static co.uk.escape.RMQTemplate.Type.*;
 
 @Controller
 public class AuthenticateUserService implements ChannelAwareMessageListener {	
 	
-//	@Autowired @RMQTemplate(RMQTemplate.Type.REGISTER_USER)
-//	RabbitTemplate registerTemplate;
+	@Autowired @RMQTemplate(REGISTER_USER)
+	RabbitTemplate registerTemplate;
 	
-	@Autowired @RMQTemplate(RMQTemplate.Type.LOGIN_USER)
-	RabbitTemplate loginTemplate;
+	@Autowired @RMQTemplate(LOGIN_USER)
+	RabbitTemplate authorisationTemplate;
+	
+	@Autowired @RMQQueue(REGISTRATION_RESPONSE)
+	Queue registrationResponseQueue;
 	
 	@Override
 	public void onMessage(Message message, Channel channel) throws Exception {
@@ -36,6 +50,8 @@ public class AuthenticateUserService implements ChannelAwareMessageListener {
 		List<String> permissions = new ArrayList<>();
 		LoginResponseMessageBundle loginResponseMessageBundle = null;
 		LoginResponse loginResponse = null;
+		MessageBundle messageBundle = null;
+		final byte[] correlationId;
 		String messageType = message.getMessageProperties().getHeaders().get("message-type").toString();
 		            
         Jackson2JsonMessageConverter jmc = new Jackson2JsonMessageConverter();
@@ -48,9 +64,13 @@ public class AuthenticateUserService implements ChannelAwareMessageListener {
 		System.out.println("Enter Authentication Service: " + messageObject);
         // END DEBUG //       
 		
+		
+		// TODO: Find a better more s way of doing this logic.
         switch(messageType){
         	case "login-request":    	
 	        	// TODO: Extract credentials from message and authenticate user.
+        		//MessageBundle mb = (MessageBundle)messageObject;
+	    		//LoginRequest loginRequest = (LoginRequest) mb.getPayload();
 	    		// TODO: If login request is authenticated, send back authentication OK response, otherwise NOK
 	        	
 	    		// Authenticate user and respond with a LoginResponse object
@@ -58,7 +78,7 @@ public class AuthenticateUserService implements ChannelAwareMessageListener {
 	    		loginResponse.setAuthorised(true); // Lets authenticate user
 		
 	    		// Get correlation id so that the response message goes back to the correct sender.
-	    		final byte[] correlationId = message.getMessageProperties().getCorrelationId();
+	    		correlationId = message.getMessageProperties().getCorrelationId();
 	    		messagePostProcessor = new MessagePostProcessor() 
 	    				{
 	    			   		public Message postProcessMessage(Message message) throws AmqpException {
@@ -72,37 +92,61 @@ public class AuthenticateUserService implements ChannelAwareMessageListener {
 	    		// Add permissions to message bundle based on user 'role'
 	    		permissions.add("permission1");
 	    		permissions.add("permission2");
-	    		// Transform message payload into message payload
 	    		
-	    		//MessageBundle mb = (MessageBundle)messageObject;
-	    		//LoginRequest loginRequest = (LoginRequest) mb.getPayload();
-	    		
-	    		
-	    		//messageBundle = bundleMessage(loginRequest, permissions);
-	    		loginResponseMessageBundle = bundleMessage(loginResponse, permissions);
+	    		// Transform message payload into message bundle
+	    		messageBundle = bundleMessage(loginResponse, permissions);
 	        	     	
 	    		// Select rabbit template
-	    		template = loginTemplate;
+	    		template = authorisationTemplate;
 	    		
+	    		System.out.println("loginResponseMessageBundle: " + loginResponseMessageBundle);
         	break;
-        case "add-user-request":
-        	// code
+        case "registration-request":
+
+        	// TODO: Extract credentials from message and authenticate user.
+        	MessageBundle registrationRequestMessageBundle = (RegistrationRequestMessageBundle)messageObject;
+    		RegistrationRequest registrationRequest = (RegistrationRequest) registrationRequestMessageBundle.getPayload();
+  
+    		// TODO: If login request is not authorised send back 401
+    		// use the authorisationTemplate to send the 401 authorisation failed response.
+    		// change the response queue on the template to the registration response queue
+      		Boolean authorised = true;
+    		if(!authorised){   			  			
+    			authorisationTemplate.setQueue(registrationResponseQueue.getName());   			
+    			template = authorisationTemplate;   			   					
+    			break;
+    		}
+    		
+    		// TODO: If login request is authenticated, forward registration request to message exchange  			
+    		// Get correlation id so that the response message goes back to the correct sender.
+    		correlationId = message.getMessageProperties().getCorrelationId();
+    		messagePostProcessor = new MessagePostProcessor() 
+    				{
+    			   		public Message postProcessMessage(Message message) throws AmqpException {
+    			   			message.getMessageProperties().setCorrelationId(correlationId);	   		
+    			   			return message;  
+    			   } 
+    		};		
+    		
+    		// Add permissions to message bundle based on user 'role'
+    		permissions.add("permission1");
+    		permissions.add("permission2");
+    		registrationRequestMessageBundle.setPermissions(permissions);
+    			
+    		// Select rabbit template
+        	template = registerTemplate;
         	
-        	//template = registerTemplate;
+        	messageBundle = registrationRequestMessageBundle;
+        	
         	break;      
         default:
         	// code
         	break;
         }
         
-		System.out.println("loginResponseMessageBundle: " + loginResponseMessageBundle);
-      
-		
-		template.convertAndSend(loginResponseMessageBundle, messagePostProcessor);	
-		
-		//template.convertAndSend(loginResponse, messagePostProcessor);
-		
-		
+	
+		template.convertAndSend(messageBundle, messagePostProcessor);	
+			
 
 		// TODO: If not a login request and authentication OK put authenticated message on message queue. Ensure that correlationID is included.
 	
@@ -113,36 +157,11 @@ public class AuthenticateUserService implements ChannelAwareMessageListener {
 	
 	
 	// Bundle message
-	private LoginResponseMessageBundle bundleMessage(LoginResponse payload, List<String> permissions) {
-		LoginResponseMessageBundle messageBundle = new LoginResponseMessageBundle(payload);
+	private MessageBundle bundleMessage(LoginResponse payload, List<String> permissions) {
+		MessageBundle messageBundle = new LoginResponseMessageBundle(payload);
 		//messageBundle.setPermissions(permissions);
 		return messageBundle;		
 	}
-
-
-
-
-	
-	
-	
-	
-//	public void authenticateUser(LoginRequest loginRequest) {
-//		
-//		System.out.println("Enter Authentication Service: " + loginRequest);
-//		
-//		// Authenticate user and respond with a LoginResponse object
-//		LoginResponse loginResponse = new LoginResponse();
-//		loginResponse.setAuthorised(true);
-//
-//		
-//
-//		//template.setCorrelationKey(correlationKey);
-//		template.convertAndSend(responseExchange.getName(), "authorisation", loginResponse );
-//		System.out.println("UUID " + template.getUUID());
-//		
-//		System.out.println("Exit Authentication Service: " + loginResponse);
-//    }
-	
 
 	
 }
